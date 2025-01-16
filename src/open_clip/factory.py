@@ -165,6 +165,18 @@ def load_state_dict(
         state_dict = {k[7:]: v for k, v in state_dict.items()}
     return state_dict
 
+def lora_compatible_state_dict(state_dict):
+    new_state_dict = {}
+    for key, val in state_dict.items():
+        if (key.startswith("visual.transformer.resblocks.") or key.startswith("transformer.resblocks.")) and ".attn." in key:
+            key = key.replace(".attn.in_proj_weight", ".attn.model.in_proj_weight")
+            key = key.replace(".attn.in_proj_bias", ".attn.model.in_proj_bias")
+            key = key.replace(".attn.out_proj.weight", ".attn.model.out_proj.base_layer.weight")
+            key = key.replace(".attn.out_proj.bias", ".attn.model.out_proj.base_layer.bias")
+            new_state_dict[key] = val
+        else:
+            new_state_dict[key] = val
+    return new_state_dict
 
 def load_checkpoint(
         model: Union[CLIP, CustomTextCLIP],
@@ -180,6 +192,9 @@ def load_checkpoint(
         return {}
 
     state_dict = load_state_dict(checkpoint_path, device=device, weights_only=weights_only)
+    
+    # lora compatible state_dict
+    state_dict = lora_compatible_state_dict(state_dict)
 
     # Detect & convert 3rd party state_dicts -> open_clip
     state_dict = convert_state_dict(model, state_dict)
@@ -207,7 +222,6 @@ def load_checkpoint(
 
     resize_pos_embed(state_dict, model)
     resize_text_pos_embed(state_dict, model)
-
     # Finally, load the massaged state_dict into model
     incompatible_keys = model.load_state_dict(state_dict, strict=strict)
     return incompatible_keys
@@ -227,6 +241,7 @@ def create_model(
         pretrained_image: bool = False,
         pretrained_hf: bool = True,
         cache_dir: Optional[str] = None,
+        enable_lora: Optional[bool] = None,
         output_dict: Optional[bool] = None,
         require_pretrained: bool = False,
         load_weights_only: bool = True,
@@ -341,7 +356,7 @@ def create_model(
         else:
             model = CustomTextCLIP(**model_cfg, cast_dtype=cast_dtype)
     else:
-        model = CLIP(**model_cfg, cast_dtype=cast_dtype)
+        model = CLIP(**model_cfg, cast_dtype=cast_dtype, enable_lora=enable_lora)
 
     if precision in ("fp16", "bf16"):
         dtype = torch.float16 if 'fp16' in precision else torch.bfloat16
@@ -389,7 +404,7 @@ def create_model(
 
         if checkpoint_path:
             logging.info(f'Loading pretrained {model_name} weights ({pretrained}).')
-            load_checkpoint(model, checkpoint_path, weights_only=load_weights_only)
+            load_checkpoint(model, checkpoint_path, strict = False, weights_only=load_weights_only)
         else:
             error_str = (
                 f'Pretrained weights ({pretrained}) not found for model {model_name}.'
@@ -479,6 +494,7 @@ def create_model_and_transforms(
         pretrained_image: bool = False,
         pretrained_hf: bool = True,
         cache_dir: Optional[str] = None,
+        enable_lora: Optional[bool] = None,
         output_dict: Optional[bool] = None,
         load_weights_only: bool = True,
         **model_kwargs,
@@ -505,6 +521,7 @@ def create_model_and_transforms(
         pretrained_image=pretrained_image,
         pretrained_hf=pretrained_hf,
         cache_dir=cache_dir,
+        enable_lora=enable_lora,
         output_dict=output_dict,
         load_weights_only=load_weights_only,
         **model_kwargs,

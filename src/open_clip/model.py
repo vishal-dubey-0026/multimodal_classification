@@ -106,7 +106,8 @@ def _build_vision_tower(
         embed_dim: int,
         vision_cfg: CLIPVisionCfg,
         quick_gelu: bool = False,
-        cast_dtype: Optional[torch.dtype] = None
+        cast_dtype: Optional[torch.dtype] = None,
+        enable_lora: Optional[bool] = None
 ):
     if isinstance(vision_cfg, dict):
         vision_cfg = CLIPVisionCfg(**vision_cfg)
@@ -166,6 +167,7 @@ def _build_vision_tower(
             output_dim=embed_dim,
             act_layer=act_layer,
             norm_layer=norm_layer,
+            enable_lora=enable_lora
         )
 
     return visual
@@ -176,6 +178,7 @@ def _build_text_tower(
         text_cfg: CLIPTextCfg,
         quick_gelu: bool = False,
         cast_dtype: Optional[torch.dtype] = None,
+        enable_lora: Optional[bool] = None,
 ):
     if isinstance(text_cfg, dict):
         text_cfg = CLIPTextCfg(**text_cfg)
@@ -215,8 +218,80 @@ def _build_text_tower(
             output_tokens=text_cfg.output_tokens,
             act_layer=act_layer,
             norm_layer=norm_layer,
+            enable_lora=enable_lora
         )
     return text
+
+class ImageTextClassifier(nn.Module):
+    def __init__(
+        self,
+        image_dim: int,
+        text_dim: int,
+        embed_dim: int,
+        num_classes: int,
+        quick_gelu: bool = False,
+        hidden_dim: int = 512,
+    ):
+        """
+        A transformer-based classifier that combines image and text embeddings.
+
+        Args:
+            image_dim (int): Dimension of image features.
+            text_dim (int): Dimension of text features.
+            embed_dim (int): Final embedding dimension.
+            num_classes (int): Number of output classes for classification.
+            quick_gelu (bool): Whether to use QuickGELU activation.
+            hidden_dim (int): Dimension of hidden layer.
+        """
+        super(ImageTextClassifier, self).__init__()
+        assert image_dim == text_dim, f"mismatch between image-dim: {image_dim} and text-dim: {text_dim}"
+
+        # Image embedding projection
+        #self.image_proj = nn.Linear(image_dim, embed_dim)
+
+        # Text embedding projection
+        #self.text_proj = nn.Linear(text_dim, embed_dim)
+
+        # Transformer encoder for joint image-text features
+        self.transformer = nn.TransformerEncoder(
+            nn.TransformerEncoderLayer(d_model=embed_dim, nhead=4),
+            num_layers=2
+        )
+
+        # Classification head
+        self.classifier = nn.Sequential(
+            nn.Linear(embed_dim, hidden_dim),
+            QuickGELU() if quick_gelu else nn.GELU(),
+            nn.Dropout(0.2),
+            nn.Linear(hidden_dim, num_classes)
+        )
+
+    def forward(self, image_features: torch.Tensor, text_features: torch.Tensor):
+        """
+        Forward pass for the Image-Text Classifier.
+
+        Args:
+            image_features (torch.Tensor): Image features (batch_size, image_dim).
+            text_features (torch.Tensor): Text features (batch_size, text_dim).
+
+        Returns:
+            torch.Tensor: Class logits (batch_size, num_classes).
+        """
+        # Project image and text features to embedding space
+        #image_embed = self.image_proj(image_features)  # (batch_size, embed_dim)
+        #text_embed = self.text_proj(text_features)  # (batch_size, embed_dim)
+
+        # Concatenate embeddings and add a batch dimension for transformer
+        combined = torch.stack([image_features, text_features], dim=1)  # (batch_size, 2, embed_dim)
+
+        # Pass through transformer
+        encoded_features = self.transformer(combined).mean(dim=1)  # (batch_size, embed_dim)
+
+        # Classification head
+        logits = self.classifier(encoded_features)  # (batch_size, num_classes)
+
+        return logits
+
 
 
 class CLIP(nn.Module):
@@ -232,14 +307,17 @@ class CLIP(nn.Module):
             init_logit_bias: Optional[float] = None,
             nonscalar_logit_scale: bool = False,
             cast_dtype: Optional[torch.dtype] = None,
+            enable_lora: Optional[bool] = None,
             output_dict: bool = False,
+            
     ):
         super().__init__()
         self.output_dict = output_dict
+        self.num_classification_class = 7
 
-        self.visual = _build_vision_tower(embed_dim, vision_cfg, quick_gelu, cast_dtype)
+        self.visual = _build_vision_tower(embed_dim, vision_cfg, quick_gelu, cast_dtype, enable_lora)
 
-        text = _build_text_tower(embed_dim, text_cfg, quick_gelu, cast_dtype)
+        text = _build_text_tower(embed_dim, text_cfg, quick_gelu, cast_dtype, enable_lora)
         self.transformer = text.transformer
         self.context_length = text.context_length
         self.vocab_size = text.vocab_size
@@ -256,6 +334,9 @@ class CLIP(nn.Module):
             self.logit_bias = nn.Parameter(torch.ones(lshape) * init_logit_bias)
         else:
             self.logit_bias = None
+        
+        self.classifier_head = ImageTextClassifier(image_dim = embed_dim, text_dim = embed_dim, embed_dim = embed_dim, num_classes = self.num_classification_class)
+
 
     def lock_image_tower(self, unlocked_groups=0, freeze_bn_stats=False):
         # lock image tower as per LiT - https://arxiv.org/abs/2111.07991
@@ -312,11 +393,13 @@ class CLIP(nn.Module):
     ):
         image_features = self.encode_image(image, normalize=True) if image is not None else None
         text_features = self.encode_text(text, normalize=True) if text is not None else None
+        classification_features = self.classifier_head(image_features = image_features, text_features = text_features) if (image is not None and text is not None) else None
 
         if self.output_dict:
             out_dict = {
                 "image_features": image_features,
                 "text_features": text_features,
+                "classification_features": classification_features,
                 "logit_scale": self.logit_scale.exp()
             }
             if self.logit_bias is not None:
@@ -324,8 +407,8 @@ class CLIP(nn.Module):
             return out_dict
 
         if self.logit_bias is not None:
-            return image_features, text_features, self.logit_scale.exp(), self.logit_bias
-        return image_features, text_features, self.logit_scale.exp()
+            return image_features, text_features, classification_features, self.logit_scale.exp(), self.logit_bias
+        return image_features, text_features, classification_features, self.logit_scale.exp()
 
 
 class CustomTextCLIP(nn.Module):

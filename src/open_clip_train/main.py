@@ -12,6 +12,8 @@ from functools import partial
 import numpy as np
 import torch
 from torch import optim
+from typing import Callable, List, Optional, Union
+
 
 try:
     import wandb
@@ -67,9 +69,85 @@ def get_latest_checkpoint(path: str, remote : bool):
         return checkpoints[-1]
     return None
 
+class ClassificationLabel(object):
+    def __init__(
+            self,
+            prepare_train_classes_for_contrastive = True
+
+            
+    ):
+        self.prepare_train_classes_for_contrastive = prepare_train_classes_for_contrastive
+        
+        self.supported_datasets = ["fakeedit", "mmhs150k", "mscoco"]
+        self.valid_labels = {0:"True", 1:"Satire/Parody", 2:"Misleading Content", 3:"Imposter Content", 4:"False Connection", 5:"Manipulated Content", 6:"Hate"} #as per fakeedit dataset + mmhs150k
+        
+        train_classes_valid_contrastive = [0] # only neutral to use for contrantive loss
+        self.train_classes_valid_contrastive = {}
+        for label in self.valid_labels.keys():
+            if label in train_classes_valid_contrastive:
+                self.train_classes_valid_contrastive[label] = 1
+            else:
+                self.train_classes_valid_contrastive[label] = 0
+
+        
+
+                                    
+        self.label_map = {dataset: {} for dataset in self.supported_datasets}
+        for dataset in self.supported_datasets:
+            if dataset == "fakeedit":
+                self.label_map[dataset] = { 0:0,
+                                            1:1,
+                                            2:2,
+                                            3:3,
+                                            4:4,
+                                            5:5}
+            elif dataset == "mmhs150k":
+                self.label_map[dataset] = { 0:0,
+                                            1:6,
+                                            2:6,
+                                            3:6,
+                                            4:6,
+                                            5:6}
+            elif dataset == "mscoco":
+                self.label_map[dataset] = { 0:0 } #no label in json file, but default is 0
+        
+
+    def __call__(self, jsons: Union[dict, List[dict]]) -> torch.LongTensor:
+        """ Returns the label of given input dataset(s)
+
+        
+        """
+        if isinstance(jsons, dict):
+            jsons = [jsons]
+
+        
+
+        all_jsons = [json for json in jsons]
+        result = torch.zeros(len(all_jsons), 2, dtype=torch.long)
+
+        for i, json in enumerate(all_jsons):
+            label = -1 
+            if "dataset" in json:
+                if json["dataset"] == "fakeedit":
+                    dataset = "fakeedit"
+                    label = self.label_map[dataset][int(json["6_way_label"])]
+                
+            elif "tweet_id" in json:
+                dataset = "mmhs150k"
+                label = self.label_map[dataset][int(json["label"])]
+            else:
+                dataset = "mscoco"
+                label = self.label_map[dataset][0] # for all neutral classes
+
+            result[i, :] = torch.tensor([label, self.train_classes_valid_contrastive[label]])
+
+        return result        
+
+
 
 def main(args):
     args = parse_args(args)
+    classification_label = ClassificationLabel()
 
     if torch.cuda.is_available():
         # This enables tf32 on Ampere GPUs which is only 8% slower than
@@ -238,8 +316,10 @@ def main(args):
         pretrained_image=args.pretrained_image,
         output_dict=True,
         cache_dir=args.cache_dir,
+        enable_lora = args.enable_lora,
         **model_kwargs,
     )
+
     if args.distill:
         # FIXME: currently assumes the model you're distilling from has the same tokenizer & transforms.
         dist_model, _, _ = create_model_and_transforms(
@@ -306,7 +386,6 @@ def main(args):
     # create optimizer and scaler
     optimizer = None
     scaler = None
-
     if args.train_data or args.dataset_type == "synthetic":
         assert not args.trace, 'Cannot train with traced model'
 
@@ -331,9 +410,21 @@ def main(args):
             )
         else:
             # If some params are not passed, we use the default values based on model name.
-            exclude = lambda n, p: p.ndim < 2 or "bn" in n or "ln" in n or "bias" in n or 'logit_scale' in n
+            exclude = lambda n, p: p.ndim < 2 or "bn" in n or "ln" in n or "bias" in n or 'logit_scale' in n or 'norm' in n # norm for classifier_head
             include = lambda n, p: not exclude(n, p)
+            if args.enable_lora:
+                for name, param in model.named_parameters():
+                    param.requires_grad = False  # Freeze all layers first
+                for name, param in model.named_parameters():
+                    if name.startswith("visual.transformer.resblocks.")  and ".attn." in name and ".model.out_proj.lora_" in name:
+                        param.requires_grad = True
+                    elif name.startswith("transformer.resblocks.") and ".attn." in name and ".model.out_proj.lora_" in name:
+                        param.requires_grad = True
+                    elif name.startswith("classifier_head.transformer.layers.") or name.startswith("classifier_head.classifier."):
+                        param.requires_grad = True
 
+                
+            
             named_parameters = list(model.named_parameters())
             gain_or_bias_params = [p for n, p in named_parameters if exclude(n, p) and p.requires_grad]
             rest_params = [p for n, p in named_parameters if include(n, p) and p.requires_grad]
@@ -400,6 +491,7 @@ def main(args):
         (preprocess_train, preprocess_val),
         epoch=start_epoch,
         tokenizer=tokenizer,
+        classification_label = classification_label
     )
     assert len(data), 'At least one train or eval dataset must be specified.'
 
@@ -471,7 +563,7 @@ def main(args):
             from open_clip.utils import convert_int8_model_to_inference_mode
             convert_int8_model_to_inference_mode(model)
         # Evaluate.
-        evaluate(model, data, start_epoch, args, tb_writer=writer, tokenizer=tokenizer)
+        evaluate(model, data, start_epoch, args, tb_writer=writer, tokenizer=tokenizer, enable_clip_metrics = False)
         return
 
     loss = create_loss(args)
@@ -484,7 +576,7 @@ def main(args):
         completed_epoch = epoch + 1
 
         if any(v in data for v in ('val', 'imagenet-val', 'imagenet-v2')):
-            evaluate(model, data, completed_epoch, args, tb_writer=writer, tokenizer=tokenizer)
+            evaluate(model, data, completed_epoch, args, tb_writer=writer, tokenizer=tokenizer, enable_clip_metrics = False)
 
         # Saving checkpoints.
         if args.save_logs:

@@ -177,6 +177,13 @@ def filter_no_caption_or_no_image(sample):
     return has_caption and has_image
 
 
+def filter_no_caption_or_no_image_or_no_json(sample):
+    has_caption = ('txt' in sample)
+    has_image = ('png' in sample or 'jpg' in sample or 'jpeg' in sample or 'webp' in sample)
+    has_json = ('json' in sample)
+    return has_caption and has_image and has_json
+
+
 def log_and_continue(exn):
     """Call in an exception handler to ignore any exception, issue a warning, and continue."""
     logging.warning(f'Handling webdataset error ({repr(exn)}). Ignoring.')
@@ -325,7 +332,7 @@ class ResampledShards2(IterableDataset):
                 yield dict(url=self.rng.choices(self.urls, weights=self.weights, k=1)[0])
 
 
-def get_wds_dataset(args, preprocess_img, is_train, epoch=0, floor=False, tokenizer=None):
+def get_wds_dataset(args, preprocess_img, is_train, epoch=0, floor=False, tokenizer=None, classification_label=None):
     input_shards = args.train_data if is_train else args.val_data
     assert input_shards is not None
     resampled = getattr(args, 'dataset_resampled', False) and is_train
@@ -387,11 +394,11 @@ def get_wds_dataset(args, preprocess_img, is_train, epoch=0, floor=False, tokeni
             wds.tarfile_to_samples(handler=log_and_continue),
         ])
     pipeline.extend([
-        wds.select(filter_no_caption_or_no_image),
+        wds.select(filter_no_caption_or_no_image_or_no_json),
         wds.decode("pilrgb", handler=log_and_continue),
-        wds.rename(image="jpg;png;jpeg;webp", text="txt"),
-        wds.map_dict(image=preprocess_img, text=lambda text: tokenizer(text)[0]),
-        wds.to_tuple("image", "text"),
+        wds.rename(image="jpg;png;jpeg;webp", text="txt", label="json"),
+        wds.map_dict(image=preprocess_img, text=lambda text: tokenizer(text)[0], label = lambda label:classification_label(label)[0]),
+        wds.to_tuple("image", "text", "label"),
         wds.batched(args.batch_size, partial=not is_train)
     ])
 
@@ -543,17 +550,17 @@ def get_dataset_fn(data_path, dataset_type):
         raise ValueError(f"Unsupported dataset type: {dataset_type}")
     
 
-def get_data(args, preprocess_fns, epoch=0, tokenizer=None):
+def get_data(args, preprocess_fns, epoch=0, tokenizer=None, classification_label = None):
     preprocess_train, preprocess_val = preprocess_fns
     data = {}
 
     if args.train_data or args.dataset_type == "synthetic":
         data["train"] = get_dataset_fn(args.train_data, args.dataset_type)(
-            args, preprocess_train, is_train=True, epoch=epoch, tokenizer=tokenizer)
+            args, preprocess_train, is_train=True, epoch=epoch, tokenizer=tokenizer, classification_label = classification_label)
 
     if args.val_data:
         data["val"] = get_dataset_fn(args.val_data, args.dataset_type)(
-            args, preprocess_val, is_train=False, tokenizer=tokenizer)
+            args, preprocess_val, is_train=False, tokenizer=tokenizer, classification_label = classification_label)
 
     if args.imagenet_val is not None:
         data["imagenet-val"] = get_imagenet(args, preprocess_fns, "val")

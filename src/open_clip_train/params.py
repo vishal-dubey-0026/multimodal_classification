@@ -475,6 +475,12 @@ def parse_args(args):
         type=str,
         help='A string to specify a specific distributed loss implementation.'
     )
+    parser.add_argument(
+        "--enable-lora",
+        default=False,
+        action='store_true',
+        help="Enable LoRA for attention layers, in image and text tower",
+    )
 
     args = parser.parse_args(args)
 

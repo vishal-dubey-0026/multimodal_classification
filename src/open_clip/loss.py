@@ -87,6 +87,7 @@ class ClipLoss(nn.Module):
         # cache state
         self.prev_num_logits = 0
         self.labels = {}
+        self.eps = 1e-6
 
     def get_ground_truth(self, device, num_logits) -> torch.Tensor:
         # calculated ground-truth and cache if enabled
@@ -125,16 +126,27 @@ class ClipLoss(nn.Module):
         
         return logits_per_image, logits_per_text
 
-    def forward(self, image_features, text_features, logit_scale, output_dict=False):
+    def forward(self, image_features, text_features, logit_scale, output_dict=False, mask = None):
+        """
+        mask (torch.Tensor): Binary mask for valid pairs, shape (N, ). mask[i] = 1 if pair (image[i], text[i]) is valid
+        """
         device = image_features.device
         logits_per_image, logits_per_text = self.get_logits(image_features, text_features, logit_scale)
 
         labels = self.get_ground_truth(device, logits_per_image.shape[0])
-
-        total_loss = (
-            F.cross_entropy(logits_per_image, labels) +
-            F.cross_entropy(logits_per_text, labels)
-        ) / 2
+        if mask is None:
+            total_loss = (
+                F.cross_entropy(logits_per_image, labels) +
+                F.cross_entropy(logits_per_text, labels)
+            ) / 2
+        else:
+            if mask.sum() > 0:
+                total_loss = ((
+                    (F.cross_entropy(logits_per_image, labels, reduction='none') * mask) + 
+                    (F.cross_entropy(logits_per_text, labels, reduction='none') * mask)
+                ).mean() / (mask.sum() + self.eps)) / 2
+            else:
+                total_loss = torch.tensor(0.0, device=logits_per_image.device)
 
         return {"contrastive_loss": total_loss} if output_dict else total_loss
 

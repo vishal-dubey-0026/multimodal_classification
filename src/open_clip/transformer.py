@@ -10,6 +10,10 @@ from torch.utils.checkpoint import checkpoint
 
 from .utils import to_2tuple
 from .pos_embed import get_2d_sincos_pos_embed
+from peft import LoraConfig, get_peft_model
+from peft.tuners.lora.model import LoraModel
+
+
 
 
 class LayerNormFp32(nn.LayerNorm):
@@ -264,6 +268,94 @@ class ResidualAttentionBlock(nn.Module):
         x = x + self.ls_2(self.mlp(self.ln_2(x)))
         return x
 
+class LoRALayer(nn.Module):
+    def __init__(self, input_dim, output_dim, rank=4, alpha=16):
+        super(LoRALayer, self).__init__()
+        self.rank = rank
+        self.alpha = alpha
+        self.scaling = alpha / rank
+
+        # LoRA weights
+        self.lora_peft_A = nn.Parameter(torch.randn(rank, input_dim) * 0.01)
+        self.lora_peft_B = nn.Parameter(torch.randn(output_dim, rank) * 0.01)
+
+    def forward(self, x):
+        return x + self.scaling * ((x @ self.lora_peft_A.t()) @ self.lora_peft_B.t())
+
+
+class ResidualAttentionBlockWithLoRA(nn.Module):
+    def __init__(
+            self,
+            d_model: int,
+            n_head: int,
+            mlp_ratio: float = 4.0,
+            ls_init_value: float = None,
+            act_layer: Callable = nn.GELU,
+            norm_layer: Callable = LayerNorm,
+            is_cross_attention: bool = False,
+            batch_first: bool = True,
+            task_type: str = None,
+            r: int = 4,
+            alpha: int = 32,
+            dropout: float = 0
+    ):
+        super().__init__()
+
+        self.ln_1 = norm_layer(d_model)
+        self.attn = nn.MultiheadAttention(d_model, n_head, batch_first=batch_first)
+        #import pdb; pdb.set_trace()
+        # LoRA configuration
+        lora_config = LoraConfig(
+            r=r,
+            lora_alpha=alpha,
+            lora_dropout=dropout,
+            target_modules=["", "out_proj"],  # Targeting in_proj_weight and out_proj.weight
+            task_type=task_type
+        )
+        self.attn = LoraModel(self.attn, lora_config, adapter_name="default")
+
+        self.ls_1 = LayerScale(d_model, ls_init_value) if ls_init_value is not None else nn.Identity()
+        if is_cross_attention:
+            self.ln_1_kv = norm_layer(d_model)
+
+        self.ln_2 = norm_layer(d_model)
+        mlp_width = int(d_model * mlp_ratio)
+        self.mlp = nn.Sequential(OrderedDict([
+            ("c_fc", nn.Linear(d_model, mlp_width)),
+            ("gelu", act_layer()),
+            ("c_proj", nn.Linear(mlp_width, d_model))
+        ]))
+        self.ls_2 = LayerScale(d_model, ls_init_value) if ls_init_value is not None else nn.Identity()
+
+    def attention(
+            self,
+            q_x: torch.Tensor,
+            k_x: Optional[torch.Tensor] = None,
+            v_x: Optional[torch.Tensor] = None,
+            attn_mask: Optional[torch.Tensor] = None,
+    ):  
+
+        k_x = k_x if k_x is not None else q_x
+        v_x = v_x if v_x is not None else q_x
+
+        attn_mask = attn_mask.to(q_x.dtype) if attn_mask is not None else None
+        return self.attn(
+            q_x, k_x, v_x, need_weights=False, attn_mask=attn_mask
+        )[0]
+
+    def forward(
+            self,
+            q_x: torch.Tensor,
+            k_x: Optional[torch.Tensor] = None,
+            v_x: Optional[torch.Tensor] = None,
+            attn_mask: Optional[torch.Tensor] = None,
+    ):
+        k_x = self.ln_1_kv(k_x) if hasattr(self, "ln_1_kv") and k_x is not None else None
+        v_x = self.ln_1_kv(v_x) if hasattr(self, "ln_1_kv") and v_x is not None else None
+        x = q_x + self.ls_1(self.attention(q_x=self.ln_1(q_x), k_x=k_x, v_x=v_x, attn_mask=attn_mask))
+        x = x + self.ls_2(self.mlp(self.ln_2(x)))
+        return x
+
 
 class CustomResidualAttentionBlock(nn.Module):
     def __init__(
@@ -326,6 +418,8 @@ class Transformer(nn.Module):
             ls_init_value: float = None,
             act_layer: Callable = nn.GELU,
             norm_layer: Callable = LayerNorm,
+            enable_lora: bool = None,
+            task_type: str = None,
             batch_first: bool = True,
     ):
         super().__init__()
@@ -333,19 +427,33 @@ class Transformer(nn.Module):
         self.layers = layers
         self.batch_first = batch_first
         self.grad_checkpointing = False
-
-        self.resblocks = nn.ModuleList([
-            ResidualAttentionBlock(
-                width,
-                heads,
-                mlp_ratio,
-                ls_init_value=ls_init_value,
-                act_layer=act_layer,
-                norm_layer=norm_layer,
-                batch_first=batch_first,
-            )
-            for _ in range(layers)
-        ])
+        if enable_lora:
+            self.resblocks = nn.ModuleList([
+                ResidualAttentionBlockWithLoRA(
+                    width,
+                    heads,
+                    mlp_ratio,
+                    ls_init_value=ls_init_value,
+                    act_layer=act_layer,
+                    norm_layer=norm_layer,
+                    batch_first=batch_first,
+                    task_type=task_type,
+                )
+                for _ in range(layers)
+            ])
+        else:
+            self.resblocks = nn.ModuleList([
+                ResidualAttentionBlock(
+                    width,
+                    heads,
+                    mlp_ratio,
+                    ls_init_value=ls_init_value,
+                    act_layer=act_layer,
+                    norm_layer=norm_layer,
+                    batch_first=batch_first,
+                )
+                for _ in range(layers)
+            ])
 
     def get_cast_dtype(self) -> torch.dtype:
         if hasattr(self.resblocks[0].mlp.c_fc, 'int8_original_dtype'):
@@ -454,6 +562,7 @@ class VisionTransformer(nn.Module):
             final_ln_after_pool: bool = False,
             act_layer: Callable = nn.GELU,
             norm_layer: Callable = LayerNorm,
+            enable_lora: bool = None,
             output_tokens: bool = False,
     ):
         super().__init__()
@@ -496,6 +605,8 @@ class VisionTransformer(nn.Module):
             ls_init_value=ls_init_value,
             act_layer=act_layer,
             norm_layer=norm_layer,
+            enable_lora=enable_lora,
+            task_type="FEATURE_EXTRACTION"
         )
 
         if attentional_pool:
@@ -692,6 +803,7 @@ class TextTransformer(nn.Module):
             proj_bias: bool = False,
             act_layer: Callable = nn.GELU,
             norm_layer: Callable = LayerNorm,
+            enable_lora: bool = None,
             output_tokens: bool = False,
     ):
         super().__init__()
@@ -720,6 +832,8 @@ class TextTransformer(nn.Module):
             ls_init_value=ls_init_value,
             act_layer=act_layer,
             norm_layer=norm_layer,
+            enable_lora=enable_lora,
+            task_type="FEATURE_EXTRACTION" # CAUSAL_LM
         )
         self.ln_final = norm_layer(width)
 

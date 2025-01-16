@@ -16,7 +16,7 @@ except ImportError:
 
 from open_clip import get_input_dtype, CLIP, CustomTextCLIP
 from open_clip_train.distributed import is_master
-from open_clip_train.zero_shot import zero_shot_eval
+from open_clip_train.zero_shot import zero_shot_eval, accuracy
 from open_clip_train.precision import get_autocast
 
 
@@ -76,7 +76,7 @@ def train_one_epoch(model, data, loss, epoch, optimizer, scaler, scheduler, dist
     sample_digits = math.ceil(math.log(dataloader.num_samples + 1, 10))
 
     if args.accum_freq > 1:
-        accum_images, accum_texts, accum_features = [], [], {}
+        accum_images, accum_texts, accum_labels, accum_features = [], [], [], {}
 
     losses_m = {}
     batch_time_m = AverageMeter()
@@ -89,9 +89,10 @@ def train_one_epoch(model, data, loss, epoch, optimizer, scaler, scheduler, dist
         if not args.skip_scheduler:
             scheduler(step)
 
-        images, texts = batch
+        images, texts, labels = batch
         images = images.to(device=device, dtype=input_dtype, non_blocking=True)
         texts = texts.to(device=device, non_blocking=True)
+        labels = labels.to(device=device, non_blocking=True)
 
         data_time_m.update(time.time() - end)
         optimizer.zero_grad()
@@ -104,9 +105,11 @@ def train_one_epoch(model, data, loss, epoch, optimizer, scaler, scheduler, dist
                     with torch.no_grad():
                         dist_model_out = dist_model(images, texts)
                     model_out.update({f'dist_{k}': v for k, v in dist_model_out.items()})
-                losses = loss(**model_out, output_dict=True)
-
-                total_loss = sum(losses.values())
+                classification_features = model_out.pop("classification_features")
+                losses = loss(**model_out, output_dict=True, mask = labels[:, 1]) # mask shape is (B,)
+                classification_loss = F.cross_entropy(classification_features, labels[:, 0], reduction='mean')
+                total_loss = sum(losses.values()) + classification_loss
+                
                 losses["loss"] = total_loss
 
             backward(total_loss, scaler)
@@ -127,6 +130,7 @@ def train_one_epoch(model, data, loss, epoch, optimizer, scaler, scheduler, dist
 
                 accum_images.append(images)
                 accum_texts.append(texts)
+                accum_labels.append(labels)
 
             # If (i + 1) % accum_freq is not zero, move on to the next batch.
             if ((i + 1) % args.accum_freq) > 0:
@@ -140,6 +144,7 @@ def train_one_epoch(model, data, loss, epoch, optimizer, scaler, scheduler, dist
             for j in range(args.accum_freq):
                 images = accum_images[j]
                 texts = accum_texts[j]
+                labels = accum_labels[j]
                 with autocast():
                     model_out = model(images, texts)
 
@@ -152,11 +157,15 @@ def train_one_epoch(model, data, loss, epoch, optimizer, scaler, scheduler, dist
                     for key, val in accum_features.items():
                         accumulated = accum_features[key]
                         inputs[key] = torch.cat(accumulated[:j] + [model_out[key]] + accumulated[j + 1:])
-
-                    losses = loss(**inputs, **inputs_no_accum, output_dict=True)
+                    labels_dic = torch.cat(accum_labels[:j] + [labels] + accum_labels[j + 1:])
+                    classification_features = inputs.pop("classification_features")
+                    losses = loss(**inputs, **inputs_no_accum, output_dict=True, mask = labels_dic[:, 1])
+                    classification_loss = F.cross_entropy(classification_features, labels_dic[:, 0], reduction='mean')
                     del inputs
                     del inputs_no_accum
-                    total_loss = sum(losses.values())
+                    del classification_features
+                    del labels_dic
+                    total_loss = sum(losses.values()) + classification_loss
                     losses["loss"] = total_loss
 
                 backward(total_loss, scaler)
@@ -182,7 +191,7 @@ def train_one_epoch(model, data, loss, epoch, optimizer, scaler, scheduler, dist
 
         # reset gradient accum, if enabled
         if args.accum_freq > 1:
-            accum_images, accum_texts, accum_features = [], [], {}
+            accum_images, accum_texts, accum_labels, accum_features = [], [], [], {}
 
         # Note: we clamp to 4.6052 = ln(100), as in the original paper.
         with torch.no_grad():
@@ -248,7 +257,7 @@ def train_one_epoch(model, data, loss, epoch, optimizer, scaler, scheduler, dist
     # end for
 
 
-def evaluate(model, data, epoch, args, tb_writer=None, tokenizer=None):
+def evaluate(model, data, epoch, args, tb_writer=None, tokenizer=None, enable_clip_metrics = False):
     metrics = {}
     if not is_master(args):
         return metrics
@@ -270,22 +279,28 @@ def evaluate(model, data, epoch, args, tb_writer=None, tokenizer=None):
         # all_image_features @ all_text_features will blow up memory and compute very quickly
         cumulative_loss = 0.0
         cumulative_gen_loss = 0.0
-        all_image_features, all_text_features = [], []
+        all_image_features, all_text_features, all_label_features = [], [], []
+        batch_size, topk_indices = None, (1,2,)
+        topk_list = [0.0 for _ in topk_indices]
         with torch.inference_mode():
             for i, batch in enumerate(dataloader):
-                images, texts = batch
+                images, texts, labels_classification = batch
                 images = images.to(device=device, dtype=input_dtype, non_blocking=True)
                 texts = texts.to(device=device, non_blocking=True)
+                labels_classification = labels_classification.to(device=device, non_blocking=True)
 
                 with autocast():
                     model_out = model(images, texts)
                     image_features = model_out["image_features"]
                     text_features = model_out["text_features"]
+                    classification_features = model_out["classification_features"]
                     logit_scale = model_out["logit_scale"]
-                    # features are accumulated in CPU tensors, otherwise GPU memory exhausted quickly
-                    # however, system RAM is easily exceeded and compute time becomes problematic
-                    all_image_features.append(image_features.cpu())
-                    all_text_features.append(text_features.cpu())
+                    if enable_clip_metrics:
+                        # features are accumulated in CPU tensors, otherwise GPU memory exhausted quickly
+                        # however, system RAM is easily exceeded and compute time becomes problematic
+                        all_image_features.append(image_features.cpu())
+                        all_text_features.append(text_features.cpu())
+                        all_label_features.append(classification_features.cpu())
                     logit_scale = logit_scale.mean()
                     logits_per_image = logit_scale * image_features @ text_features.t()
                     logits_per_text = logits_per_image.t()
@@ -298,8 +313,13 @@ def evaluate(model, data, epoch, args, tb_writer=None, tokenizer=None):
                     ) / 2
 
                     gen_loss = maybe_compute_generative_loss(model_out)
+                    
+                    topk_acc = accuracy(output = classification_features, target = labels_classification[:, 0], topk=topk_indices) # return raw count, not normalized accuracy
+                    topk_list = [prev+cur for prev,cur in zip(topk_list, topk_acc)]
+
 
                 cumulative_loss += total_loss * batch_size
+                
                 num_samples += batch_size
                 if is_master(args) and (i % 100) == 0:
                     logging.info(
@@ -310,12 +330,19 @@ def evaluate(model, data, epoch, args, tb_writer=None, tokenizer=None):
                         cumulative_gen_loss += gen_loss * batch_size
                         logging.info(
                             f"Generative Loss: {cumulative_gen_loss / num_samples:.6f}\t")
+                    cumulative_topk_acc = [acc/num_samples*100.0 for acc in topk_list]
+                    logging.info(
+                            f"Topk accuracy({topk_indices}): {cumulative_topk_acc}\t")
 
-            val_metrics = get_clip_metrics(
-                image_features=torch.cat(all_image_features),
-                text_features=torch.cat(all_text_features),
-                logit_scale=logit_scale.cpu(),
-            )
+            if enable_clip_metrics:
+                # this is very ram mem. heavy, kills workers and causes oom, only use for small evaluation set!
+                val_metrics = get_clip_metrics(
+                    image_features=torch.cat(all_image_features),
+                    text_features=torch.cat(all_text_features),
+                    logit_scale=logit_scale.cpu(),
+                )
+            else:
+                val_metrics = {"get_clip_metrics_dummy": 0.0}
             loss = cumulative_loss / num_samples
             metrics.update(
                 {**val_metrics, "clip_val_loss": loss.item(), "epoch": epoch, "num_samples": num_samples}
@@ -323,6 +350,10 @@ def evaluate(model, data, epoch, args, tb_writer=None, tokenizer=None):
             if gen_loss is not None:
                 gen_loss = cumulative_gen_loss / num_samples
                 metrics.update({"val_generative_loss": gen_loss.item()})
+            
+            cumulative_topk_acc = [acc/num_samples*100.0 for acc in topk_list]
+            for i, idx in enumerate(topk_indices):
+              metrics.update({f"topk_accuracy@{idx}": cumulative_topk_acc[i]})
 
     if not metrics:
         return metrics
@@ -376,6 +407,12 @@ def get_clip_metrics(image_features, text_features, logit_scale):
 
     return metrics
 
+
+def maybe_compute_generative_loss(model_out):
+    if "logits" in model_out and "labels" in model_out:
+        token_logits = model_out["logits"]
+        token_labels = model_out["labels"]
+        return F.cross_entropy(token_logits.permute(0, 2, 1), token_labels)
 
 def maybe_compute_generative_loss(model_out):
     if "logits" in model_out and "labels" in model_out:
