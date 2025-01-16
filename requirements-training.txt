@@ -11,3 +11,5 @@ safetensors
 transformers[sentencepiece]
 timm>=1.0.10
 fsspec
+img2dataset
+albumentations==1.1.0
